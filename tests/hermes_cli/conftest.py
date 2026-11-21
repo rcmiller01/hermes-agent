@@ -175,6 +175,29 @@ def _reset_prompt_toolkit_output_cache():
     yield
     _clear()
 
+@pytest.fixture(autouse=True)
+def _no_live_pr_state_lookup(monkeypatch):
+    """No ``hermes_cli`` test may shell out to ``gh pr view`` for the respawn guard.
+
+    The ``active_pr`` guard resolves the state of every PR a card links. In a
+    test that URL is a fixture (``example/repo/pull/44``) and the answer decides
+    the assertion, so the lookup must not be a live call: default it to the
+    fail-closed ``UNKNOWN`` — the hold the guard kept before terminal states
+    lifted it — and start each test from an empty cache. Tests that exercise the
+    lookup patch ``_query_pr_state`` (or ``subprocess.run``) after this fixture,
+    and their patch wins.
+
+    ``raising=False`` keeps this fixture inert on a checkout where the resolver
+    does not exist yet (the RED commit that pins the terminal-state behaviour
+    runs against the unpatched guard).
+    """
+    from hermes_cli import kanban_active_pr as kapr
+
+    for name in ("_pr_state_cache", "_pr_state_inflight"):
+        getattr(kapr, name, {}).clear()
+    monkeypatch.setattr(kapr, "_query_pr_state", lambda url: "UNKNOWN", raising=False)
+
+
 @pytest.fixture
 def probe_root(tmp_path):
     """A fixture checkout the installation launcher can boot from.
