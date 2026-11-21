@@ -10,8 +10,10 @@ that the work landed.
 
 The reads are bounded by a small process-local cache that caches failures too,
 so an outage costs one ``gh`` call per PR identity per interval rather than one
-per dispatch tick. The lift itself is recorded in the DB (``respawn_guard_lifted``
-on the task), so it survives a process replay.
+per dispatch tick; when the cache is full of fresh entries a new identity is
+held without a lookup (fail closed) rather than displacing a live answer. The
+lift itself is recorded in the DB (``respawn_guard_lifted`` on the task), so it
+survives a process replay.
 
 Split out of ``hermes_cli.kanban_db_dispatch``, whose :func:`check_respawn_guard`
 owns the priority order across all guard reasons and calls in here for this step
@@ -99,12 +101,14 @@ def _query_pr_state(url: str) -> str:
     except ValueError:
         payload = None
     state = payload.get("state") if isinstance(payload, dict) else None
-    if not isinstance(state, str) or state.upper() not in _PR_STATE_KNOWN:
+    # Exact enum only: GitHub spells the states OPEN/MERGED/CLOSED, and a
+    # lowercase or mixed-case spelling is not that payload — hold, do not guess.
+    # Normalising it would lift the hold on a string GitHub never emits.
+    if not isinstance(state, str) or state not in _PR_STATE_KNOWN:
         _log.warning(
             "kanban: gh pr view %s returned an unexpected payload — holding the respawn guard", url,
         )
         return _PR_STATE_UNKNOWN
-    state = state.upper()
     if state not in _TERMINAL_PR_STATES:
         _log.info("kanban: %s is %s — the respawn guard holds until it is MERGED/CLOSED", url, state)
     return state
@@ -117,7 +121,9 @@ def _cached_pr_state(key: str, url: str, *, now: Optional[float] = None) -> str:
     Failures are cached like any other answer, so a gh outage or a 404 costs one
     lookup per identity per TTL rather than one per dispatch tick. A concurrent
     caller for an identity already being looked up waits for that lookup's
-    result instead of issuing a second ``gh`` call.
+    result instead of issuing a second ``gh`` call — and a wait that times out,
+    a missing entry, or one that has already expired is not evidence of
+    anything: hold (``UNKNOWN``), never reuse a stale terminal answer.
     """
     now = time.time() if now is None else now
     with _pr_state_lock:
@@ -127,14 +133,27 @@ def _cached_pr_state(key: str, url: str, *, now: Optional[float] = None) -> str:
         waiter = _pr_state_inflight.get(key)
         owner = waiter is None
         if owner:
+            if not _pr_state_admit(key, now):
+                # Every entry is fresh and the cache is full: admitting one more
+                # identity would mean displacing a live answer and querying it
+                # again inside its interval. Hold instead — fail closed.
+                _log.warning(
+                    "kanban: PR-state cache full (%d identities) — holding the "
+                    "respawn guard for %s without a lookup",
+                    _PR_STATE_CACHE_MAX, url,
+                )
+                return _PR_STATE_UNKNOWN
             waiter = threading.Event()
             _pr_state_inflight[key] = waiter
     if not owner:
-        # Another caller owns the lookup: take its result once it lands.
-        waiter.wait(_PR_STATE_TIMEOUT_SECONDS + 1)
+        # Another caller owns the lookup: take its result once it lands, but only
+        # if the wait succeeded AND the stored entry is still unexpired.
+        completed = waiter.wait(_PR_STATE_TIMEOUT_SECONDS + 1)
         with _pr_state_lock:
             entry = _pr_state_cache.get(key)
-        return entry[1] if entry is not None else _PR_STATE_UNKNOWN
+        if completed and entry is not None and entry[0] > now:
+            return entry[1]
+        return _PR_STATE_UNKNOWN
     state = _PR_STATE_UNKNOWN
     try:
         state = _query_pr_state(url)
@@ -149,14 +168,27 @@ def _cached_pr_state(key: str, url: str, *, now: Optional[float] = None) -> str:
     return state
 
 
+def _pr_state_admit(key: str, now: float) -> bool:
+    """Reserve room to store one identity's entry. Purge only EXPIRED entries;
+    never displace a live one — displacement would let a saturated scan re-query
+    an identity inside its interval, defeating the per-identity lookup ceiling.
+
+    A key already cached (an expired entry being refreshed) always fits in
+    place. Otherwise admission needs a free slot: capacity counts the live
+    entries AND the in-flight lookups that have not stored yet, so concurrent
+    admissions cannot push the cache past ``_PR_STATE_CACHE_MAX``.
+    """
+    for expired in [k for k, (expires, _) in _pr_state_cache.items() if expires <= now]:
+        del _pr_state_cache[expired]
+    if key in _pr_state_cache:
+        return True
+    reserved = len(_pr_state_cache) + sum(1 for k in _pr_state_inflight if k not in _pr_state_cache)
+    return reserved < _PR_STATE_CACHE_MAX
+
+
 def _pr_state_store(key: str, state: str, now: float) -> None:
-    """Insert one cache entry, evicting expired entries first and then the
-    soonest-expiring one — the cache stays within ``_PR_STATE_CACHE_MAX``."""
-    if key not in _pr_state_cache and len(_pr_state_cache) >= _PR_STATE_CACHE_MAX:
-        for expired in [k for k, (expires, _) in _pr_state_cache.items() if expires <= now]:
-            del _pr_state_cache[expired]
-        while len(_pr_state_cache) >= _PR_STATE_CACHE_MAX:
-            del _pr_state_cache[min(_pr_state_cache, key=lambda k: _pr_state_cache[k][0])]
+    """Insert one cache entry. The slot was reserved by :func:`_pr_state_admit`
+    before the lookup, so this only overwrites and never grows past the cap."""
     _pr_state_cache[key] = (now + _PR_STATE_CACHE_TTL_SECONDS, state)
 
 
@@ -185,17 +217,26 @@ def record_lift(
     """
     if dry_run:
         return
-    payload = {
-        "generation": int(generation),
-        "prs": [{"repo": repo, "number": number, "state": state} for repo, number, state in states],
-    }
-    if conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'respawn_guard_lifted' "
-        "AND payload = ? LIMIT 1",
-        (task_id, _kb._json_or_null(payload)),
-    ).fetchone() is not None:
-        return
+    # Canonical identity/state payload: repo lower-cased and the set sorted by
+    # canonical identity, so the same PR set spelled or ordered differently
+    # dedupes to one event.
+    prs = sorted(
+        ({"repo": repo.lower(), "number": int(number), "state": state}
+         for repo, number, state in states),
+        key=lambda pr: (pr["repo"], pr["number"]),
+    )
+    payload = {"generation": int(generation), "prs": prs}
+    # Check + append inside ONE write transaction (``BEGIN IMMEDIATE``). A SELECT
+    # outside it races a second connection's INSERT — both read "absent" and both
+    # append — so the dedup must be atomic with the insert, not merely serialized
+    # by SQLite around a later INSERT.
     with _kb.write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'respawn_guard_lifted' "
+            "AND payload = ? LIMIT 1",
+            (task_id, _kb._json_or_null(payload)),
+        ).fetchone() is not None:
+            return
         _kb._append_event(conn, task_id, "respawn_guard_lifted", payload)
 
 
