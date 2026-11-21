@@ -27,6 +27,7 @@ import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -107,7 +108,7 @@ class _gh:
         return sum(1 for called, _ in self.calls if called == url)
 
 
-def _events(conn, tid: str, kind: str | None = None) -> list[tuple[str, object]]:
+def _events(conn, tid: str, kind: str | None = None) -> list[tuple[str, Any]]:
     rows = conn.execute(
         "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
     ).fetchall()
@@ -138,7 +139,8 @@ def _pr_comment(conn, tid: str, body: str = f"Opened {PR_OPEN} for review.") -> 
         ((0, '{"state":"MERGED"}'), "MERGED"),
         ((0, '{"state":"CLOSED"}'), "CLOSED"),
         ((0, '{"state":"OPEN"}'), "OPEN"),
-        ((0, '{"state":"merged"}'), "MERGED"),  # gh's casing is not load-bearing
+        ((0, '{"state":"merged"}'), "UNKNOWN"),  # exact enum only: lowercase holds
+        ((0, '{"state":"Closed"}'), "UNKNOWN"),  # ...and mixed case holds
         ((0, '{"state":"WEIRD"}'), "UNKNOWN"),
         ((0, '{"number":44}'), "UNKNOWN"),
         ((0, "[]"), "UNKNOWN"),
@@ -214,14 +216,169 @@ def test_cached_pr_state_caches_failures() -> None:
     assert gh.count(PR_OPEN) == 1
 
 
-def test_cached_pr_state_evicts_at_capacity() -> None:
-    with _gh() as gh:
-        for number in range(kapr._PR_STATE_CACHE_MAX + 1):
-            kapr._cached_pr_state(f"example/repo#{number}",
-                                 f"https://github.com/example/repo/pull/{number}")
+def test_cached_pr_state_saturates_without_evicting_a_live_entry(monkeypatch) -> None:
+    """F2: at capacity, a new identity is held WITHOUT a lookup — a live entry is
+    never displaced, so an identity is never re-queried inside its interval."""
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(kapr.time, "time", lambda: clock.now)
+    calls: list[str] = []
+
+    def query(url: str) -> str:
+        calls.append(url)
+        return "OPEN"
+
+    monkeypatch.setattr(kapr, "_query_pr_state", query)
+    for number in range(kapr._PR_STATE_CACHE_MAX):
+        kapr._cached_pr_state(f"example/repo#{number}",
+                              f"https://github.com/example/repo/pull/{number}")
+    # Assert WHILE the cache is populated (the old test inspected it after
+    # _gh.__exit__ had emptied it, so its bounds were vacuous).
+    assert len(kapr._pr_state_cache) == kapr._PR_STATE_CACHE_MAX
+    assert len(calls) == kapr._PR_STATE_CACHE_MAX
+    retained = "example/repo#0"
+    overflow = "example/repo#9999"
+    overflow_url = "https://github.com/example/repo/pull/9999"
+    assert kapr._cached_pr_state(overflow, overflow_url) == "UNKNOWN"
+    assert overflow_url not in calls  # held fail-closed, no lookup
+    assert len(kapr._pr_state_cache) == kapr._PR_STATE_CACHE_MAX
+    assert retained in kapr._pr_state_cache  # the 129th identity did not displace it
+    # Repeated scans stay bounded and never re-query a retained identity.
+    for _ in range(3):
+        assert kapr._cached_pr_state(retained, "https://github.com/example/repo/pull/0") == "OPEN"
+        assert kapr._cached_pr_state(overflow, overflow_url) == "UNKNOWN"
+    assert calls.count("https://github.com/example/repo/pull/0") == 1
+    assert calls.count(overflow_url) == 0
+
+
+def test_saturated_cache_reclaims_only_expired_entries(monkeypatch) -> None:
+    """F2: once an entry expires its slot is reusable; the cap still holds."""
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(kapr.time, "time", lambda: clock.now)
+    calls: list[str] = []
+    monkeypatch.setattr(kapr, "_query_pr_state", lambda url: (calls.append(url), "OPEN")[1])
+    for number in range(kapr._PR_STATE_CACHE_MAX):
+        kapr._cached_pr_state(f"example/repo#{number}",
+                              f"https://github.com/example/repo/pull/{number}")
+    assert kapr._cached_pr_state("example/repo#9999",
+                                 "https://github.com/example/repo/pull/9999") == "UNKNOWN"
+    clock.now += kapr._PR_STATE_CACHE_TTL_SECONDS + 1
+    assert kapr._cached_pr_state("example/repo#9999",
+                                 "https://github.com/example/repo/pull/9999") == "OPEN"
+    assert len(kapr._pr_state_cache) == 1  # every expired entry was reclaimed
+    assert len(calls) == kapr._PR_STATE_CACHE_MAX + 1
+
+
+def test_failed_lookups_count_against_capacity(monkeypatch) -> None:
+    """F2: cached failures bound retries — and they occupy slots like any answer."""
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(kapr.time, "time", lambda: clock.now)
+    calls: list[str] = []
+    monkeypatch.setattr(kapr, "_query_pr_state", lambda url: (calls.append(url), "UNKNOWN")[1])
+    for number in range(kapr._PR_STATE_CACHE_MAX):
+        assert kapr._cached_pr_state(f"example/repo#{number}",
+                                     f"https://github.com/example/repo/pull/{number}") == "UNKNOWN"
+    overflow_url = "https://github.com/example/repo/pull/9999"
+    assert kapr._cached_pr_state("example/repo#9999", overflow_url) == "UNKNOWN"
+    assert overflow_url not in calls
+    assert len(kapr._pr_state_cache) == kapr._PR_STATE_CACHE_MAX
+
+
+def test_concurrent_admissions_never_exceed_the_cap(monkeypatch) -> None:
+    """F2: in-flight lookups count toward capacity, so concurrent admissions of
+    distinct identities cannot push the cache past ``_PR_STATE_CACHE_MAX``."""
+    full = threading.Event()
+    release = threading.Event()
+    queries: list[str] = []
+    lock = threading.Lock()
+
+    def query(url: str) -> str:
+        with lock:
+            queries.append(url)
+            if len(queries) >= kapr._PR_STATE_CACHE_MAX:
+                full.set()
+        release.wait(5)
+        return "OPEN"
+
+    monkeypatch.setattr(kapr, "_query_pr_state", query)
+    extra = 16
+    results: dict[str, str] = {}
+
+    def run(number: int) -> None:
+        results[str(number)] = kapr._cached_pr_state(
+            f"example/repo#{number}", f"https://github.com/example/repo/pull/{number}")
+
+    threads = [threading.Thread(target=run, args=(n,))
+               for n in range(kapr._PR_STATE_CACHE_MAX + extra)]
+    for thread in threads:
+        thread.start()
+    assert full.wait(5)
+    # MAX owners are all in flight; the surplus callers must already have held
+    # without a lookup. No thread beyond the cap has issued a query.
+    assert len(queries) == kapr._PR_STATE_CACHE_MAX
+    assert len(kapr._pr_state_inflight) == kapr._PR_STATE_CACHE_MAX
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    assert len(queries) == kapr._PR_STATE_CACHE_MAX
     assert len(kapr._pr_state_cache) <= kapr._PR_STATE_CACHE_MAX
-    assert "example/repo#0" not in kapr._pr_state_cache  # the soonest-expiring entry went
-    assert gh.count("https://github.com/example/repo/pull/0") == 1
+    assert list(results.values()).count("UNKNOWN") >= extra
+
+
+def test_stale_waiter_never_returns_an_expired_terminal_state(monkeypatch) -> None:
+    """F1: an expired MERGED entry plus a held refresh must yield UNKNOWN, not
+    the stale MERGED — the timeout path is fail-closed."""
+    monkeypatch.setattr(kapr, "_PR_STATE_TIMEOUT_SECONDS", 0.2)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(kapr.time, "time", lambda: clock.now)
+    kapr._pr_state_cache["example/repo#44"] = (clock.now - 1, "MERGED")  # expired
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_query(url: str) -> str:
+        started.set()
+        release.wait(5)
+        return "UNKNOWN"
+
+    monkeypatch.setattr(kapr, "_query_pr_state", blocking_query)
+    owner = threading.Thread(
+        target=lambda: kapr._cached_pr_state("example/repo#44", PR_OPEN))
+    owner.start()
+    assert started.wait(5)
+    try:
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "UNKNOWN"
+    finally:
+        release.set()
+        owner.join(5)
+
+
+def test_guard_holds_when_the_only_terminal_answer_is_stale(monkeypatch, kanban_home) -> None:
+    """F1 through the guard: a stale MERGED that a waiter cannot refresh holds."""
+    monkeypatch.setattr(kapr, "_PR_STATE_TIMEOUT_SECONDS", 0.2)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(kapr.time, "time", lambda: clock.now)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_query(url: str) -> str:
+        started.set()
+        release.wait(5)
+        return "UNKNOWN"
+
+    monkeypatch.setattr(kapr, "_query_pr_state", blocking_query)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale waiter", assignee="worker")
+        _pr_comment(conn, tid)
+        kapr._pr_state_cache["example/repo#44"] = (clock.now - 1, "MERGED")
+        owner = threading.Thread(target=lambda: kapr.terminal_states([f"Opened {PR_OPEN}"]))
+        owner.start()
+        assert started.wait(5)
+        try:
+            assert kapr.terminal_states([f"Opened {PR_OPEN}"]) is None  # hold, not stale lift
+            guard = kbd.check_respawn_guard(conn, tid)
+        finally:
+            release.set()
+            owner.join(5)
+    assert guard == "active_pr"
 
 
 def test_concurrent_lookup_of_one_identity_calls_gh_once(monkeypatch) -> None:
@@ -313,6 +470,19 @@ def test_unreadable_pr_state_holds_fail_closed(kanban_home, answer) -> None:
     """An unreadable state is not evidence of a merge — hold, and say why."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unknown pr", assignee="worker")
+        _pr_comment(conn, tid)
+        with _gh({PR_OPEN: answer}):
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard == "active_pr"
+    assert lifted == []
+
+
+@pytest.mark.parametrize("answer", [(0, '{"state":"merged"}'), (0, '{"state":"Closed"}')])
+def test_unexpected_terminal_spelling_holds_the_guard(kanban_home, answer) -> None:
+    """F4: only the exact MERGED/CLOSED enum lifts; a case variant holds."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="lowercase terminal", assignee="worker")
         _pr_comment(conn, tid)
         with _gh({PR_OPEN: answer}):
             guard = kbd.check_respawn_guard(conn, tid)
@@ -453,6 +623,91 @@ def test_dry_run_records_no_lift_event(kanban_home) -> None:
         with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}):
             assert kbd.check_respawn_guard(conn, tid, dry_run=True) is None
         assert _events(conn, tid, "respawn_guard_lifted") == []
+
+
+def _canonical_payload(generation: int) -> dict:
+    return {"generation": generation,
+            "prs": [{"repo": "example/repo", "number": 44, "state": "MERGED"}]}
+
+
+def test_record_lift_canonicalises_identity_case_and_order(kanban_home) -> None:
+    """F3: the same PR set spelled or ordered differently is ONE event."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="canonical", assignee="worker")
+        kapr.record_lift(conn, tid, [("Example/Repo", 44, "MERGED")], generation=1000, dry_run=False)
+        kapr.record_lift(conn, tid, [("example/repo", 44, "MERGED")], generation=1000, dry_run=False)
+        kapr.record_lift(
+            conn, tid, [("example/repo", 45, "CLOSED"), ("example/repo", 44, "MERGED")],
+            generation=1000, dry_run=False)
+        kapr.record_lift(
+            conn, tid, [("example/repo", 44, "MERGED"), ("example/repo", 45, "CLOSED")],
+            generation=1000, dry_run=False)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    # One event for the re-cased identity, one for the two-PR set; each spelling
+    # and ordering of the same identity set collapses to its canonical form.
+    assert [event[1] for event in lifted] == [
+        {"generation": 1000,
+         "prs": [{"repo": "example/repo", "number": 44, "state": "MERGED"}]},
+        {"generation": 1000,
+         "prs": [{"repo": "example/repo", "number": 44, "state": "MERGED"},
+                 {"repo": "example/repo", "number": 45, "state": "CLOSED"}]},
+    ]
+
+
+def test_record_lift_persists_across_independent_connections(kanban_home) -> None:
+    """F3: a second connection sees the first's event and does not re-append."""
+    with kbc.connect() as conn1:
+        tid = kb.create_task(conn1, title="persist", assignee="worker")
+        kapr.record_lift(conn1, tid, [("example/repo", 44, "MERGED")], generation=1000, dry_run=False)
+    with kbc.connect() as conn2:
+        kapr.record_lift(conn2, tid, [("example/repo", 44, "MERGED")], generation=1000, dry_run=False)
+        assert len(_events(conn2, tid, "respawn_guard_lifted")) == 1
+
+
+def test_record_lift_check_and_append_are_atomic_across_connections(kanban_home) -> None:
+    """F3: a check BEFORE the write txn lets two connections both read "absent"
+    and append twice. The check must run inside the same ``BEGIN IMMEDIATE``."""
+    with kbc.connect() as setup:
+        tid = kb.create_task(setup, title="atomic", assignee="worker")
+    started = threading.Event()
+    attempted = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def holder() -> None:
+        conn = kbc.connect()
+        try:
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "respawn_guard_lifted", _canonical_payload(1000))
+                started.set()
+                release.wait(5)
+        except BaseException as exc:  # noqa: BLE001 - surfaced via errors
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    def writer() -> None:
+        conn = kbc.connect()
+        try:
+            attempted.set()
+            kapr.record_lift(conn, tid, [("example/repo", 44, "MERGED")], generation=1000, dry_run=False)
+        except BaseException as exc:  # noqa: BLE001 - surfaced via errors
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    holder_thread = threading.Thread(target=holder)
+    holder_thread.start()
+    assert started.wait(5)
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    assert attempted.wait(5)
+    release.set()
+    holder_thread.join(10)
+    writer_thread.join(10)
+    assert errors == []
+    with kbc.connect() as check:
+        assert len(_events(check, tid, "respawn_guard_lifted")) == 1
 
 
 def test_dispatch_once_spawns_a_card_whose_linked_pr_is_terminal(
