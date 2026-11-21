@@ -33,10 +33,12 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_active_pr as kapr
 
 # The shared hermes_cli conftest stubs the resolver so no test reaches the
-# network; the tests below drive the real one through the ``gh`` stub.
-_REAL_QUERY_PR_STATE = getattr(kbd, "_query_pr_state", None)
+# network; the tests below drive the real one (in ``kanban_active_pr``) through
+# the ``gh`` stub.
+_REAL_QUERY_PR_STATE = getattr(kapr, "_query_pr_state", None)
 
 PR_OPEN = "https://github.com/example/repo/pull/44"
 PR_MERGED = "https://github.com/example/repo/pull/45"
@@ -57,7 +59,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _reset_pr_cache() -> None:
     """Empty the resolver's bounded cache; absent on a checkout without the lift."""
     for name in ("_pr_state_cache", "_pr_state_inflight"):
-        getattr(kbd, name, {}).clear()
+        getattr(kapr, name, {}).clear()
 
 
 class _gh:
@@ -79,18 +81,18 @@ class _gh:
         if _REAL_QUERY_PR_STATE is not None:
             # Undo the conftest's hermetic stub: these tests exercise the real
             # resolver, with only its subprocess transport replaced.
-            kbd._query_pr_state = _REAL_QUERY_PR_STATE
-        self._saved_run = kbd.subprocess.run
-        kbd.subprocess.run = self._run
+            kapr._query_pr_state = _REAL_QUERY_PR_STATE
+        self._saved_run = kapr.subprocess.run
+        kapr.subprocess.run = self._run
         return self
 
     def __exit__(self, *_exc) -> None:
-        kbd.subprocess.run = self._saved_run
+        kapr.subprocess.run = self._saved_run
         _reset_pr_cache()
 
     def _run(self, command, **kwargs):
-        self.calls.append((command[2], kwargs))
-        answer = self.answers.get(command[2], (0, '{"state":"OPEN"}'))
+        self.calls.append((command[3], kwargs))
+        answer = self.answers.get(command[3], (0, '{"state":"OPEN"}'))
         if isinstance(answer, BaseException):
             raise answer
         returncode, stdout = answer
@@ -152,13 +154,13 @@ def _pr_comment(conn, tid: str, body: str = f"Opened {PR_OPEN} for review.") -> 
 def test_pr_state_reads_only_exact_known_states(answer, expected) -> None:
     """Every non-terminal answer is UNKNOWN, and the guard holds on UNKNOWN."""
     with _gh({PR_OPEN: answer}):
-        assert kbd._query_pr_state(PR_OPEN) == expected
+        assert kapr._query_pr_state(PR_OPEN) == expected
 
 
 def test_pr_state_query_is_a_bounded_gh_pr_view() -> None:
     """The lookup is ``gh pr view <url> --json state`` with a 5-second timeout."""
     with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}) as gh:
-        assert kbd._query_pr_state(PR_OPEN) == "MERGED"
+        assert kapr._query_pr_state(PR_OPEN) == "MERGED"
     url, kwargs = gh.calls[0]
     assert url == PR_OPEN
     assert kwargs["timeout"] == 5
@@ -167,7 +169,7 @@ def test_pr_state_query_is_a_bounded_gh_pr_view() -> None:
 
 def test_pr_links_dedupes_by_identity_across_comments() -> None:
     """All URLs, all comments, one entry per canonical PR identity."""
-    links = kbd._pr_links([
+    links = kapr.pr_links([
         f"Opened {PR_OPEN} and {PR_MERGED}/files",
         f"see https://github.com/Example/Repo/pull/44 and {PR_CLOSED}",
         "no PR here",
@@ -184,41 +186,41 @@ def test_pr_links_dedupes_by_identity_across_comments() -> None:
 
 def test_cached_pr_state_serves_a_repeat_lookup_from_the_cache(monkeypatch) -> None:
     clock = SimpleNamespace(now=1000.0)
-    monkeypatch.setattr(kbd.time, "time", lambda: clock.now)
+    monkeypatch.setattr(kapr.time, "time", lambda: clock.now)
     with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}) as gh:
-        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
-        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
         assert gh.count(PR_OPEN) == 1
-        clock.now += kbd._PR_STATE_CACHE_TTL_SECONDS - 1
-        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
+        clock.now += kapr._PR_STATE_CACHE_TTL_SECONDS - 1
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
         assert gh.count(PR_OPEN) == 1
 
 
 def test_cached_pr_state_re_queries_after_the_ttl(monkeypatch) -> None:
     clock = SimpleNamespace(now=1000.0)
-    monkeypatch.setattr(kbd.time, "time", lambda: clock.now)
+    monkeypatch.setattr(kapr.time, "time", lambda: clock.now)
     with _gh() as gh:
-        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "OPEN"
-        clock.now += kbd._PR_STATE_CACHE_TTL_SECONDS + 1
-        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "OPEN"
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "OPEN"
+        clock.now += kapr._PR_STATE_CACHE_TTL_SECONDS + 1
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "OPEN"
     assert gh.count(PR_OPEN) == 2
 
 
 def test_cached_pr_state_caches_failures() -> None:
     """A gh outage costs one lookup per identity per interval, not one per tick."""
     with _gh({PR_OPEN: subprocess.TimeoutExpired(["gh"], 5)}) as gh:
-        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "UNKNOWN"
-        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "UNKNOWN"
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "UNKNOWN"
+        assert kapr._cached_pr_state("example/repo#44", PR_OPEN) == "UNKNOWN"
     assert gh.count(PR_OPEN) == 1
 
 
 def test_cached_pr_state_evicts_at_capacity() -> None:
     with _gh() as gh:
-        for number in range(kbd._PR_STATE_CACHE_MAX + 1):
-            kbd._cached_pr_state(f"example/repo#{number}",
+        for number in range(kapr._PR_STATE_CACHE_MAX + 1):
+            kapr._cached_pr_state(f"example/repo#{number}",
                                  f"https://github.com/example/repo/pull/{number}")
-    assert len(kbd._pr_state_cache) <= kbd._PR_STATE_CACHE_MAX
-    assert "example/repo#0" not in kbd._pr_state_cache  # the soonest-expiring entry went
+    assert len(kapr._pr_state_cache) <= kapr._PR_STATE_CACHE_MAX
+    assert "example/repo#0" not in kapr._pr_state_cache  # the soonest-expiring entry went
     assert gh.count("https://github.com/example/repo/pull/0") == 1
 
 
@@ -234,12 +236,12 @@ def test_concurrent_lookup_of_one_identity_calls_gh_once(monkeypatch) -> None:
         release.wait(5)
         return "MERGED"
 
-    monkeypatch.setattr(kbd, "_query_pr_state", blocking_query)
+    monkeypatch.setattr(kapr, "_query_pr_state", blocking_query)
     results: list[str] = []
-    owner = threading.Thread(target=lambda: results.append(kbd._cached_pr_state("example/repo#44", PR_OPEN)))
+    owner = threading.Thread(target=lambda: results.append(kapr._cached_pr_state("example/repo#44", PR_OPEN)))
     owner.start()
     assert started.wait(5)
-    waiter = threading.Thread(target=lambda: results.append(kbd._cached_pr_state("example/repo#44", PR_OPEN)))
+    waiter = threading.Thread(target=lambda: results.append(kapr._cached_pr_state("example/repo#44", PR_OPEN)))
     waiter.start()
     release.set()
     owner.join(5)

@@ -191,11 +191,11 @@ def _no_live_pr_state_lookup(monkeypatch):
     does not exist yet (the RED commit that pins the terminal-state behaviour
     runs against the unpatched guard).
     """
-    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_active_pr as kapr
 
     for name in ("_pr_state_cache", "_pr_state_inflight"):
-        getattr(kbd, name, {}).clear()
-    monkeypatch.setattr(kbd, "_query_pr_state", lambda url: "UNKNOWN", raising=False)
+        getattr(kapr, name, {}).clear()
+    monkeypatch.setattr(kapr, "_query_pr_state", lambda url: "UNKNOWN", raising=False)
 
 
 @pytest.fixture
