@@ -1,0 +1,472 @@
+"""Terminal-state lift for the ``active_pr`` respawn guard.
+
+``active_pr`` exists to stop a ready card from being re-spawned into a duplicate
+PR while the implementer's PR is still in flight. It held for the whole 24-hour
+window even after every linked PR had been MERGED or CLOSED — the work was
+finished, but the card stayed un-spawnable.
+
+These tests pin the boundary of the lift, all of it through the guard's real
+code path with only the ``gh`` transport stubbed:
+
+* MERGED and CLOSED lift (the guard returns None, and one
+  ``respawn_guard_lifted`` event records the PR numbers and states);
+* OPEN holds, and so does every unreadable answer — a non-zero ``gh`` exit, a
+  timeout, a missing ``gh``, a malformed or unexpected payload — fail closed;
+* a card linking several PRs (across several comments, duplicates included) is
+  clear only when EVERY one of them is terminal, and each identity costs one
+  lookup;
+* the handoff waiver and the 24-hour window are untouched;
+* the lift event is written once per (task, comment generation, PR set), so a
+  replayed tick or a dry run does not re-emit it.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+
+# The shared hermes_cli conftest stubs the resolver so no test reaches the
+# network; the tests below drive the real one through the ``gh`` stub.
+_REAL_QUERY_PR_STATE = getattr(kbd, "_query_pr_state", None)
+
+PR_OPEN = "https://github.com/example/repo/pull/44"
+PR_MERGED = "https://github.com/example/repo/pull/45"
+PR_CLOSED = "https://github.com/example/repo/pull/46"
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Isolated HERMES_HOME with an empty kanban DB."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+def _reset_pr_cache() -> None:
+    """Empty the resolver's bounded cache; absent on a checkout without the lift."""
+    for name in ("_pr_state_cache", "_pr_state_inflight"):
+        getattr(kbd, name, {}).clear()
+
+
+class _gh:
+    """A ``gh`` transport stub: ``answers`` maps URL -> ``(returncode, stdout)``
+    or an exception to raise; anything unlisted is an OPEN PR.
+
+    A non-zero returncode is raised as ``CalledProcessError`` exactly as
+    ``subprocess.run(..., check=True)`` reports it, so the guard sees the same
+    shapes it sees in production.
+    """
+
+    def __init__(self, answers: dict | None = None) -> None:
+        self.answers = answers or {}
+        self.calls: list[tuple[str, dict]] = []
+        self._saved_run = None
+
+    def __enter__(self) -> "_gh":
+        _reset_pr_cache()
+        if _REAL_QUERY_PR_STATE is not None:
+            # Undo the conftest's hermetic stub: these tests exercise the real
+            # resolver, with only its subprocess transport replaced.
+            kbd._query_pr_state = _REAL_QUERY_PR_STATE
+        self._saved_run = kbd.subprocess.run
+        kbd.subprocess.run = self._run
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        kbd.subprocess.run = self._saved_run
+        _reset_pr_cache()
+
+    def _run(self, command, **kwargs):
+        self.calls.append((command[2], kwargs))
+        answer = self.answers.get(command[2], (0, '{"state":"OPEN"}'))
+        if isinstance(answer, BaseException):
+            raise answer
+        returncode, stdout = answer
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, command, output=stdout, stderr=stdout)
+        return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
+
+    def urls(self) -> list[str]:
+        return [url for url, _ in self.calls]
+
+    def count(self, url: str) -> int:
+        return sum(1 for called, _ in self.calls if called == url)
+
+
+def _events(conn, tid: str, kind: str | None = None) -> list[tuple[str, object]]:
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+    ).fetchall()
+    out = [(r["kind"], json.loads(r["payload"]) if r["payload"] else None) for r in rows]
+    return out if kind is None else [e for e in out if e[0] == kind]
+
+
+def _backdate_comments(conn, tid: str, seconds: int) -> None:
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - ? WHERE task_id = ?",
+            (seconds, tid),
+        )
+
+
+def _pr_comment(conn, tid: str, body: str = f"Opened {PR_OPEN} for review.") -> None:
+    kb.add_comment(conn, tid, author="worker", body=body)
+
+
+# ---------------------------------------------------------------------------
+# The resolver: one bounded gh read, fail-closed on everything else
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "answer,expected",
+    [
+        ((0, '{"state":"MERGED"}'), "MERGED"),
+        ((0, '{"state":"CLOSED"}'), "CLOSED"),
+        ((0, '{"state":"OPEN"}'), "OPEN"),
+        ((0, '{"state":"merged"}'), "MERGED"),  # gh's casing is not load-bearing
+        ((0, '{"state":"WEIRD"}'), "UNKNOWN"),
+        ((0, '{"number":44}'), "UNKNOWN"),
+        ((0, "[]"), "UNKNOWN"),
+        ((0, "not json"), "UNKNOWN"),
+        ((0, ""), "UNKNOWN"),
+        ((1, "no pull requests found"), "UNKNOWN"),
+        ((4, "gh: not logged in"), "UNKNOWN"),
+        (FileNotFoundError("gh"), "UNKNOWN"),
+        (subprocess.TimeoutExpired(["gh"], 5), "UNKNOWN"),
+        (OSError("connection reset"), "UNKNOWN"),
+    ],
+)
+def test_pr_state_reads_only_exact_known_states(answer, expected) -> None:
+    """Every non-terminal answer is UNKNOWN, and the guard holds on UNKNOWN."""
+    with _gh({PR_OPEN: answer}):
+        assert kbd._query_pr_state(PR_OPEN) == expected
+
+
+def test_pr_state_query_is_a_bounded_gh_pr_view() -> None:
+    """The lookup is ``gh pr view <url> --json state`` with a 5-second timeout."""
+    with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}) as gh:
+        assert kbd._query_pr_state(PR_OPEN) == "MERGED"
+    url, kwargs = gh.calls[0]
+    assert url == PR_OPEN
+    assert kwargs["timeout"] == 5
+    assert kwargs["check"] is True
+
+
+def test_pr_links_dedupes_by_identity_across_comments() -> None:
+    """All URLs, all comments, one entry per canonical PR identity."""
+    links = kbd._pr_links([
+        f"Opened {PR_OPEN} and {PR_MERGED}/files",
+        f"see https://github.com/Example/Repo/pull/44 and {PR_CLOSED}",
+        "no PR here",
+    ])
+    assert [key for key, _, _, _ in links] == ["example/repo#44", "example/repo#45", "example/repo#46"]
+    assert links[1][3] == PR_MERGED  # a /files suffix still queries the PR
+    assert links[0][3] == PR_OPEN  # first spelling of a duplicated identity wins
+
+
+# ---------------------------------------------------------------------------
+# The cache: bounded, at most one lookup per identity per interval
+# ---------------------------------------------------------------------------
+
+
+def test_cached_pr_state_serves_a_repeat_lookup_from_the_cache(monkeypatch) -> None:
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(kbd.time, "time", lambda: clock.now)
+    with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}) as gh:
+        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
+        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
+        assert gh.count(PR_OPEN) == 1
+        clock.now += kbd._PR_STATE_CACHE_TTL_SECONDS - 1
+        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "MERGED"
+        assert gh.count(PR_OPEN) == 1
+
+
+def test_cached_pr_state_re_queries_after_the_ttl(monkeypatch) -> None:
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(kbd.time, "time", lambda: clock.now)
+    with _gh() as gh:
+        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "OPEN"
+        clock.now += kbd._PR_STATE_CACHE_TTL_SECONDS + 1
+        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "OPEN"
+    assert gh.count(PR_OPEN) == 2
+
+
+def test_cached_pr_state_caches_failures() -> None:
+    """A gh outage costs one lookup per identity per interval, not one per tick."""
+    with _gh({PR_OPEN: subprocess.TimeoutExpired(["gh"], 5)}) as gh:
+        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "UNKNOWN"
+        assert kbd._cached_pr_state("example/repo#44", PR_OPEN) == "UNKNOWN"
+    assert gh.count(PR_OPEN) == 1
+
+
+def test_cached_pr_state_evicts_at_capacity() -> None:
+    with _gh() as gh:
+        for number in range(kbd._PR_STATE_CACHE_MAX + 1):
+            kbd._cached_pr_state(f"example/repo#{number}",
+                                 f"https://github.com/example/repo/pull/{number}")
+    assert len(kbd._pr_state_cache) <= kbd._PR_STATE_CACHE_MAX
+    assert "example/repo#0" not in kbd._pr_state_cache  # the soonest-expiring entry went
+    assert gh.count("https://github.com/example/repo/pull/0") == 1
+
+
+def test_concurrent_lookup_of_one_identity_calls_gh_once(monkeypatch) -> None:
+    """Two callers, one identity, one ``gh`` call: the second takes the first's result."""
+    started = threading.Event()
+    release = threading.Event()
+    queries: list[str] = []
+
+    def blocking_query(url: str) -> str:
+        queries.append(url)
+        started.set()
+        release.wait(5)
+        return "MERGED"
+
+    monkeypatch.setattr(kbd, "_query_pr_state", blocking_query)
+    results: list[str] = []
+    owner = threading.Thread(target=lambda: results.append(kbd._cached_pr_state("example/repo#44", PR_OPEN)))
+    owner.start()
+    assert started.wait(5)
+    waiter = threading.Thread(target=lambda: results.append(kbd._cached_pr_state("example/repo#44", PR_OPEN)))
+    waiter.start()
+    release.set()
+    owner.join(5)
+    waiter.join(5)
+    assert queries == [PR_OPEN]
+    assert results == ["MERGED", "MERGED"]
+
+
+# ---------------------------------------------------------------------------
+# The guard: terminal states lift, everything else holds
+# ---------------------------------------------------------------------------
+
+
+def test_merged_pr_lifts_the_active_pr_guard(kanban_home) -> None:
+    """A merged PR is finished work: the card may be spawned again."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already merged", assignee="worker")
+        _pr_comment(conn, tid)
+        generation = conn.execute(
+            "SELECT MAX(created_at) AS ts FROM task_comments WHERE task_id = ?", (tid,)
+        ).fetchone()["ts"]
+        with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard is None
+    assert gh.urls() == [PR_OPEN]
+    assert lifted == [("respawn_guard_lifted",
+                       {"generation": generation,
+                        "prs": [{"repo": "example/repo", "number": 44, "state": "MERGED"}]})]
+
+
+def test_closed_pr_lifts_the_active_pr_guard(kanban_home) -> None:
+    """CLOSED (abandoned, superseded) is terminal too: no duplicate can follow it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="closed pr", assignee="worker")
+        _pr_comment(conn, tid)
+        with _gh({PR_OPEN: (0, '{"state":"CLOSED"}')}):
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard is None
+    assert lifted[0][1]["prs"] == [{"repo": "example/repo", "number": 44, "state": "CLOSED"}]
+
+
+def test_open_pr_holds_the_active_pr_guard(kanban_home) -> None:
+    """The PR is still in flight: re-spawning would duplicate it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="open pr", assignee="worker")
+        _pr_comment(conn, tid)
+        with _gh({PR_OPEN: (0, '{"state":"OPEN"}')}):
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard == "active_pr"
+    assert lifted == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (1, "no pull requests found"),
+        (4, "gh: not logged in"),
+        (0, "not json"),
+        (0, '{"state":"WEIRD"}'),
+        (0, ""),
+        FileNotFoundError("gh"),
+        subprocess.TimeoutExpired(["gh"], 5),
+    ],
+)
+def test_unreadable_pr_state_holds_fail_closed(kanban_home, answer) -> None:
+    """An unreadable state is not evidence of a merge — hold, and say why."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unknown pr", assignee="worker")
+        _pr_comment(conn, tid)
+        with _gh({PR_OPEN: answer}):
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard == "active_pr"
+    assert lifted == []
+
+
+def test_one_open_pr_among_several_holds_the_guard(kanban_home) -> None:
+    """Every linked PR must be terminal; one open PR keeps the card held."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="three prs", assignee="worker")
+        _pr_comment(conn, tid, body=f"Opened {PR_MERGED} and {PR_CLOSED}")
+        kb.add_comment(conn, tid, author="worker", body=f"Also opened {PR_OPEN}")
+        with _gh({PR_MERGED: (0, '{"state":"MERGED"}'), PR_CLOSED: (0, '{"state":"CLOSED"}'),
+                  PR_OPEN: (0, '{"state":"OPEN"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard == "active_pr"
+    assert sorted(gh.urls()) == sorted([PR_MERGED, PR_CLOSED, PR_OPEN])
+    assert lifted == []
+
+
+def test_prs_across_several_comments_lift_when_all_are_terminal(kanban_home) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="two comments", assignee="worker")
+        _pr_comment(conn, tid, body=f"Opened {PR_MERGED}")
+        kb.add_comment(conn, tid, author="worker", body=f"Also {PR_CLOSED}")
+        with _gh({PR_MERGED: (0, '{"state":"MERGED"}'), PR_CLOSED: (0, '{"state":"CLOSED"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard is None
+    assert sorted(gh.urls()) == sorted([PR_MERGED, PR_CLOSED])
+    assert len(lifted) == 1
+    assert lifted[0][1]["prs"] == [
+        {"repo": "example/repo", "number": 45, "state": "MERGED"},
+        {"repo": "example/repo", "number": 46, "state": "CLOSED"},
+    ]
+
+
+def test_duplicate_pr_urls_cost_one_lookup(kanban_home) -> None:
+    """The same PR linked from three comments (and re-cased) is one identity."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="dupes", assignee="worker")
+        _pr_comment(conn, tid, body=f"Opened {PR_OPEN}")
+        kb.add_comment(conn, tid, author="worker", body=f"still {PR_OPEN}")
+        kb.add_comment(conn, tid, author="other",
+                       body="and https://github.com/Example/Repo/pull/44/files")
+        with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid)
+    assert guard is None
+    assert gh.count(PR_OPEN) == 1
+    assert gh.count("https://github.com/Example/Repo/pull/44") == 0
+
+
+def test_handoff_after_the_newest_pr_comment_lifts_without_a_lookup(kanban_home) -> None:
+    """The handoff waiver keeps priority: no gh call, no lift event needed."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="handed over", assignee="worker")
+        _pr_comment(conn, tid)
+        _backdate_comments(conn, tid, 60)
+        assert kb.assign_task(conn, tid, "closer") is True
+        with _gh({PR_OPEN: (0, '{"state":"OPEN"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid)
+        lifted = _events(conn, tid, "respawn_guard_lifted")
+    assert guard is None
+    assert gh.calls == []
+    assert lifted == []
+
+
+def test_a_newer_pr_comment_after_the_handoff_guards_again(kanban_home) -> None:
+    """Newest-comment semantics survive: the closer's own PR comment re-holds it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="handed over then commented", assignee="worker")
+        _pr_comment(conn, tid)
+        _backdate_comments(conn, tid, 60)
+        assert kb.assign_task(conn, tid, "closer") is True
+        with _gh({PR_OPEN: (0, '{"state":"OPEN"}')}):
+            assert kbd.check_respawn_guard(conn, tid) is None
+        kb.add_comment(conn, tid, author="closer", body=f"Pushed to {PR_OPEN}")
+        with _gh({PR_OPEN: (0, '{"state":"OPEN"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid)
+    assert guard == "active_pr"
+    assert gh.count(PR_OPEN) == 1
+
+
+def test_pr_comment_older_than_the_guard_window_is_ignored(kanban_home) -> None:
+    """The 24-hour upper bound is unchanged: an old PR comment neither holds nor lifts."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="old pr comment", assignee="worker")
+        _pr_comment(conn, tid)
+        _backdate_comments(conn, tid, kbd._RESPAWN_GUARD_PR_WINDOW + 1)
+        with _gh({PR_OPEN: (0, '{"state":"OPEN"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid)
+    assert guard is None
+    assert gh.calls == []
+
+
+def test_review_lane_never_looks_up_pr_state(kanban_home) -> None:
+    """The review lane's PR comment is the input to a review, not a duplicate signal."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review me", assignee="reviewer")
+        _pr_comment(conn, tid)
+        with _gh({PR_OPEN: (0, '{"state":"OPEN"}')}) as gh:
+            guard = kbd.check_respawn_guard(conn, tid, lane="review")
+    assert guard is None
+    assert gh.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The lift event: written once per (task, generation, terminal PR set)
+# ---------------------------------------------------------------------------
+
+
+def test_lift_event_is_not_re_emitted_for_the_same_generation(kanban_home) -> None:
+    """A replayed dispatch tick (or a later tick over unchanged comments) is silent."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="replayed tick", assignee="worker")
+        _pr_comment(conn, tid)
+        with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}):
+            assert kbd.check_respawn_guard(conn, tid) is None
+            assert kbd.check_respawn_guard(conn, tid) is None
+            # A dry run holds the event back entirely, and writes nothing.
+            assert kbd.check_respawn_guard(conn, tid, dry_run=True) is None
+        assert len(_events(conn, tid, "respawn_guard_lifted")) == 1
+
+        # A NEW PR comment is a new generation: the lift is recorded again.
+        kb.add_comment(conn, tid, author="worker", body=f"Opened {PR_MERGED} too")
+        with _gh({PR_OPEN: (0, '{"state":"MERGED"}'), PR_MERGED: (0, '{"state":"MERGED"}')}):
+            assert kbd.check_respawn_guard(conn, tid) is None
+        assert len(_events(conn, tid, "respawn_guard_lifted")) == 2
+
+
+def test_dry_run_records_no_lift_event(kanban_home) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="dry run only", assignee="worker")
+        _pr_comment(conn, tid)
+        with _gh({PR_OPEN: (0, '{"state":"MERGED"}')}):
+            assert kbd.check_respawn_guard(conn, tid, dry_run=True) is None
+        assert _events(conn, tid, "respawn_guard_lifted") == []
+
+
+def test_dispatch_once_spawns_a_card_whose_linked_pr_is_terminal(
+    kanban_home, all_assignees_spawnable
+) -> None:
+    """End to end through the dispatcher: merged lifts, open still holds."""
+    with kbc.connect() as conn:
+        merged = kb.create_task(conn, title="merged pr", assignee="worker")
+        _pr_comment(conn, merged, body=f"Opened {PR_MERGED}")
+        opened = kb.create_task(conn, title="open pr", assignee="worker")
+        _pr_comment(conn, opened, body=f"Opened {PR_OPEN}")
+        with _gh({PR_MERGED: (0, '{"state":"MERGED"}'), PR_OPEN: (0, '{"state":"OPEN"}')}):
+            res = kbd.dispatch_once(conn, dry_run=True)
+        lifted = _events(conn, merged, "respawn_guard_lifted")
+    assert merged in [s[0] for s in res.spawned]
+    assert dict(res.respawn_guarded).get(opened) == "active_pr"
+    assert opened not in [s[0] for s in res.spawned]
+    # dry_run: no lift event, even though the guard lifted.
+    assert lifted == []
